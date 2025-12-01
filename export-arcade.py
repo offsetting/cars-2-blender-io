@@ -112,15 +112,7 @@ def compile_mesh(meshName: str, boneNames: list[str], needsTangentBinormal: bool
         if needsTangentBinormal:
             mesh.calc_tangents(uvmap=uvLayerName)
     
-    positions = [None] * len(mesh.vertices)
-    boneIndices = [None] * len(mesh.vertices)
-    blendWeights = [None] * len(mesh.vertices)
-    normals = [(0.0, 0.0, 0.0)] * len(mesh.vertices)
-    uv1s = [(0.0, 0.0)] * len(mesh.vertices)
-    if needsTangentBinormal:
-        tangents = [None] * len(mesh.vertices)
-        binormals = [None] * len(mesh.vertices)
-    
+    # NOTE: we will construct per-loop arrays to preserve different UVs on the same vertex
     if not IS_WORLD:
         remapData = set()
         for vi, v in enumerate(mesh.vertices):
@@ -130,51 +122,89 @@ def compile_mesh(meshName: str, boneNames: list[str], needsTangentBinormal: bool
                     remapData.add(boneIndex)
         remapData = list(remapData)
 
+        # per-vertex positions still used for fallback but we'll use loop_positions for export
         for vi, v in enumerate(mesh.vertices):
-            positions[vi] = (v.co.x, v.co.y, v.co.z)
-
-            boneIndexSet = [0, 0, 0, 0]
-            blendWeightSet = [0.0, 0.0, 0.0, 0.0]
-            for i, group in enumerate(v.groups):
-                boneIndex = boneNames.index(object.vertex_groups[group.group].name)
-                boneIndexSet[i] = remapData.index(boneIndex)
-                blendWeightSet[i] = group.weight
-            
-            boneIndices[vi] = boneIndexSet
-            blendWeights[vi] = blendWeightSet
+            pass
     else:
         remapData = None
-        for vi, v in enumerate(mesh.vertices):
-            positions[vi] = (v.co.x, v.co.y, v.co.z)
+
+    # --- NEW: build per-loop attribute arrays ---
+    loop_positions = []
+    loop_uv1s = []
+    loop_normals = []
+    loop_tangents = []
+    loop_binormals = []
+    loop_boneIndices = []
+    loop_blendWeights = []
 
     for li, loop in enumerate(mesh.loops):
         vi = loop.vertex_index
-        normal = loop.normal
-        normals[vi] = (normal.x, normal.y, normal.z)
+        v = mesh.vertices[vi]
 
+        # Position (copied from vertex)
+        loop_positions.append((v.co.x, v.co.y, v.co.z))
+
+        # Normal per loop
+        n = loop.normal
+        loop_normals.append((n.x, n.y, n.z))
+
+        # UV per loop
         if hasUvs:
             uv = mesh.uv_layers[uvLayerName].data[li].uv
-            uv1s[vi] = (uv.x, 1.0 - uv.y) if INVERT_UVS else (uv.x, uv.y)
-        
+            loop_uv1s.append((uv.x, 1.0 - uv.y) if INVERT_UVS else (uv.x, uv.y))
+        else:
+            loop_uv1s.append((0.0, 0.0))
+
+        # Bone data per loop (derived from vertex groups on the vertex)
+        if not IS_WORLD:
+            bi = [0, 0, 0, 0]
+            bw = [0.0, 0.0, 0.0, 0.0]
+            for i, group in enumerate(v.groups):
+                boneIndex = boneNames.index(object.vertex_groups[group.group].name)
+                bi[i] = remapData.index(boneIndex)
+                bw[i] = group.weight
+            loop_boneIndices.append(bi)
+            loop_blendWeights.append(bw)
+
+        # Tangent / binormal per loop
         if needsTangentBinormal:
-            tangent = loop.tangent
-            binormal = tangent.cross(normal)
-            
-            tangents[vi] = (tangent.x, tangent.y, tangent.z)
-            binormals[vi] = (binormal.x, binormal.y, binormal.z)
-    
-    if needsTangentBinormal:
-        mesh.free_tangents()
-    
-    indices = []
+            t = loop.tangent
+            b = t.cross(n)
+            loop_tangents.append((t.x, t.y, t.z))
+            loop_binormals.append((b.x, b.y, b.z))
+        else:
+            loop_tangents.append(None)
+            loop_binormals.append(None)
+
+    # Build indices using loop indices (so they reference per-loop attributes)
+    loop_indices = []
     for tri in mesh.loop_triangles:
-        indices.extend(tri.vertices)
-    
+        loop_indices.extend(tri.loops)
+
+    # Compact vertices using per-loop arrays so vertices are duplicated when their loop attributes differ
     if needsTangentBinormal:
-        indices, positions, uv1s, boneIndices, blendWeights, normals, tangents, binormals = compact_vertices(indices, positions, uv1s, boneIndices, blendWeights, normals, tangents, binormals)
+        indices, positions, uv1s, boneIndices, blendWeights, normals, tangents, binormals = compact_vertices(
+            loop_indices,
+            loop_positions,
+            loop_uv1s,
+            loop_boneIndices if not IS_WORLD else None,
+            loop_blendWeights if not IS_WORLD else None,
+            loop_normals,
+            loop_tangents if needsTangentBinormal else None,
+            loop_binormals if needsTangentBinormal else None
+        )
         return CompiledMesh(positions, boneIndices, blendWeights, normals, uv1s, tangents, binormals, hasUvs, remapData, indices)
     else:
-        indices, positions, uv1s, boneIndices, blendWeights, normals, _, _ = compact_vertices(indices, positions, uv1s, boneIndices, blendWeights, normals, None, None)
+        indices, positions, uv1s, boneIndices, blendWeights, normals, _, _ = compact_vertices(
+            loop_indices,
+            loop_positions,
+            loop_uv1s,
+            loop_boneIndices if not IS_WORLD else None,
+            loop_blendWeights if not IS_WORLD else None,
+            loop_normals,
+            None,
+            None
+        )
         return CompiledMesh(positions, boneIndices, blendWeights, normals, uv1s, None, None, hasUvs, remapData, indices)
 
 def finalize_mesh(mesh: CompiledMesh, needsTangentBinormal: bool) -> tuple[bytes, bytes, bytes]:
@@ -199,8 +229,8 @@ def finalize_mesh(mesh: CompiledMesh, needsTangentBinormal: bool) -> tuple[bytes
     
     return vStream0, vStream1, iStream
 
-SCENE_NAME = "racergt1"
-SOURCE_OCT_JSON = "C:\\Projects\\OctaneEngine\\cinematic-oilrig\\cinematic_oilrig\\cinematic_oilrig.oct.json"
+SCENE_NAME = "ripclutch"
+SOURCE_OCT_JSON = "C:\\Projects\\OctaneEngine\\Cars 2 Arcade\\carscade\\assets\\dlc\\car_0008\\frontend\\characters\\francesco_hotrod\\francesco_hotrod\\characters\\francesco_hotrod\\francesco_hotrod.oct.json"
 DESTINATION_FOLDER = "C:\\Projects\\OctaneEngine\\BlenderIO\\destination\\"
 
 with open(SOURCE_OCT_JSON) as _tup:
@@ -219,26 +249,27 @@ if IS_CUSTOM_MODEL:
         "Main",
         "Body",
         "FrontEnd",
+        "CheekLowerRight",
+        "CheekUpperRight",
+        "CheekLowerLeft",
+        "CheekUpperLeft",
+        "LipLowerCornerRight",
+        "LipUpperCornerRight",
+        "LipLowerMidRight",
+        "LipLowerMidLeft",
+        "LipLowerCornerLeft",
+        "LipUpperCornerLeft",
+        "LipUpperMidRight",
+        "LipUpperMidLeft",
+        "LipLowerCenter",
+        "LipUpperCenter",
+        "TeethUpper",
         "Jaw",
         "TeethLower",
         "TongueRoot",
         "Tongue1",
         "Tongue2",
-        "TeethUpper",
-        "LipUpperCenter",
-        "LipLowerCenter",
-        "LipUpperMidLeft",
-        "LipUpperMidRight",
-        "LipUpperCornerLeft",
-        "LipLowerCornerLeft",
-        "LipLowerMidLeft",
-        "LipLowerMidRight",
-        "LipUpperCornerRight",
-        "LipLowerCornerRight",
-        "CheekUpperLeft",
-        "CheekLowerLeft",
-        "CheekUpperRight",
-        "CheekLowerRight",
+        "BackEnd",
         "BrowCornerRight",
         "BrowMidRight",
         "BrowCenter",
@@ -246,13 +277,17 @@ if IS_CUSTOM_MODEL:
         "BrowCornerLeft",
         "TireFLeft_centerJoint",
         "TireFLeft_SpinJoint",
+        "TireFLeft_SuspensionJoint",
         "TireFRight_centerJoint",
         "TireFRight_SpinJoint",
+        "TireFRight_SuspensionJoint",
         "TireBLeft_centerJoint",
         "TireBLeft_SpinJoint",
+        "TireBLeft_SuspensionJoint",
         "TireBRight_centerJoint",
-        "TireBRight_SpinJoint"
-    ]    
+        "TireBRight_SpinJoint",
+        "TireBRight_SuspensionJoint"
+    ]  
 else:
     _boneIdToNameDict = {}
     for node in inTup["SceneTreeNodePool"]:
