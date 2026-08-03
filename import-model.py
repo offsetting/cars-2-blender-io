@@ -144,8 +144,8 @@ def read_vertex_streams(tup: dict, vstreams: list[int], vBufMap: dict, remapData
         vbuf.close()
     return elementMapFinal
 
-SCENE = "mater"
-SCENE_FOLDER = "C:\\Projects\\OctaneEngine\\Cars2\\BlenderIO\\source\\"
+SCENE = "explosionfireyb"
+SCENE_FOLDER = "Z:\\CARS-MODDING\\GAMES\\Cars 2 Arcade Essentials\\assets\\choreographies\\explosionfireyb\\"
 
 with open(SCENE_FOLDER + SCENE + ".oct.json") as tmp:
     tup = json.load(tmp)
@@ -158,11 +158,18 @@ for buffer in tup["VertexBufferPool"]:
         vBufMap[bufferIndex] = SCENE_FOLDER + tup["VertexBufferPool"][buffer]["FileName"]
 
 iBufMap = {}
+iBufWidthMap = {}
 
 for buffer in tup["IndexBufferPool"]:
     if tup["IndexBufferPool"][buffer]["Name"] == "Static" and "FileName" in tup["IndexBufferPool"][buffer]:
         bufferIndex = int(buffer.split("#")[1])
         iBufMap[bufferIndex] = SCENE_FOLDER + tup["IndexBufferPool"][buffer]["FileName"]
+        iBufWidthMap[bufferIndex] = tup["IndexBufferPool"][buffer]["Width"]
+
+# Index buffer element width isn't always 2 bytes (ushort) across every asset;
+# non-character props have been seen with different widths, so pick the dtype
+# from the actual buffer instead of hardcoding u2.
+_INDEX_DTYPES = {1: '<u1', 2: '<u2', 4: '<u4'}
 
 istreams = []
 
@@ -188,13 +195,20 @@ for node in tup["SceneTreeNodePool"]:
         vstreamIndices = tup["SceneTreeNodePool"][node]["VertexStreamReferences"]
         istreamIndex = tup["SceneTreeNodePool"][node]["IndexStreamReference"]
         
-        # Get RemapData
+        # Get RemapData. Not every sub-mesh is skinned: non-character models
+        # (e.g. this explosion effect) mix rigged parts (SKINMesh_*) with plain
+        # static/ambient sub-geometry (e.g. the light billboards) that has no
+        # SceneComponentReferences at all (None instead of a 1-length list).
+        # Treat those as unrigged instead of asserting.
         if not IS_WORLD:
-            sceneComponentRefs = tup["SceneTreeNodePool"][node]["SceneComponentReferences"]
-            assert(len(sceneComponentRefs) == 1)
-            skinRemap = tup["SceneComponentPool"]["SceneComponent#" + str(sceneComponentRefs[0])]
-            assert(skinRemap["Type"] == "SkinRemap")
-            remapData = skinRemap["RemapData"]
+            sceneComponentRefs = tup["SceneTreeNodePool"][node].get("SceneComponentReferences")
+            if sceneComponentRefs:
+                assert(len(sceneComponentRefs) == 1)
+                skinRemap = tup["SceneComponentPool"]["SceneComponent#" + str(sceneComponentRefs[0])]
+                assert(skinRemap["Type"] == "SkinRemap")
+                remapData = skinRemap["RemapData"]
+            else:
+                remapData = None
         else:
             remapData = None
         print(remapData)
@@ -204,7 +218,8 @@ for node in tup["SceneTreeNodePool"]:
         bpy.context.collection.objects.link(obj)
         
         istream = istreams[istreamIndex]
-        indexData = np.fromfile(iBufMap[istream.iBufIndex], dtype='<u2', count=istream.length, offset=istream.iBufOffset)
+        indexDtype = _INDEX_DTYPES.get(iBufWidthMap.get(istream.iBufIndex, 2), '<u2')
+        indexData = np.fromfile(iBufMap[istream.iBufIndex], dtype=indexDtype, count=istream.length, offset=istream.iBufOffset)
 
         vstreams = read_vertex_streams(tup, vstreamIndices, vBufMap, remapData)
 
@@ -223,7 +238,7 @@ for node in tup["SceneTreeNodePool"]:
                     v_idx = loop.vertex_index
                     uv_layer.data[li].uv = uvs[v_idx]
         
-        if 'BoneIndices' in vstreams and 'BlendWeights' in vstreams:
+        if 'BoneIndices' in vstreams and 'BlendWeights' in vstreams and remapData is not None:
             boneIndices = vstreams['BoneIndices']
             blendWeights = vstreams['BlendWeights']
             # Add all necessary vertex groups
@@ -261,13 +276,19 @@ def compute_world(boneId):
     if boneId in worldMats:
         return worldMats[boneId]
     parentSceneTreeNodeIndex = find_scene_tree_node(tup, boneIdToName[boneId])["ParentNodeReferences"][0]
+    parentNode = tup["SceneTreeNodePool"]["Node#" + str(parentSceneTreeNodeIndex)]
     local = localToParentMats[boneId]
-    if boneIdToName[boneId] != 'Main':
-        parentId = tup["SceneTreeNodePool"]["Node#" + str(parentSceneTreeNodeIndex)]["BoneID"]
+    # A bone is a root bone if its scene-tree parent isn't itself a Bone node.
+    # Character rigs conventionally root at a bone literally named "Main", but
+    # non-character models (props/effects, like this one) can instead parent
+    # every bone directly under a Geometry/Transform node with no such name.
+    # Detect "is my parent a Bone?" structurally instead of relying on the name.
+    if parentNode.get("Type") == "Bone":
+        parentId = parentNode["BoneID"]
         parentWorld = compute_world(parentId)
         w = parentWorld @ local
     else:
-        # We're handling a root, bone, so its world matrix is the same as the local -> parent matrix.
+        # We're handling a root bone, so its world matrix is the same as the local -> parent matrix.
         w = local.copy()
     worldMats[boneId] = w
     return w
@@ -275,67 +296,74 @@ def compute_world(boneId):
 for i in range(len(boneIdToName)):
     compute_world(i)
 
-armatureData = bpy.data.armatures.new(SCENE)
-armatureObj = bpy.data.objects.new(SCENE, armatureData)
-bpy.context.collection.objects.link(armatureObj)
-bpy.context.view_layer.objects.active = armatureObj
-armatureObj.select_set(True)
+# Fully static props (no bones at all) don't need an armature; skip this
+# whole section rather than creating/parenting an empty, pointless one.
+if boneIdToName:
+    armatureData = bpy.data.armatures.new(SCENE)
+    armatureObj = bpy.data.objects.new(SCENE, armatureData)
+    bpy.context.collection.objects.link(armatureObj)
+    bpy.context.view_layer.objects.active = armatureObj
+    armatureObj.select_set(True)
 
-# Here, we switch to Edit mode to manipulate edit bones.
-bpy.ops.object.mode_set(mode='EDIT')
-editBones = armatureData.edit_bones
+    # Here, we switch to Edit mode to manipulate edit bones.
+    bpy.ops.object.mode_set(mode='EDIT')
+    editBones = armatureData.edit_bones
 
-for i in range(len(boneIdToName)):
-    eb = editBones.new(boneIdToName[i])
-    eb.head = Vector((0.0,0.0,0.0))
-    eb.tail = Vector((0.0,0.1,0.0))
+    for i in range(len(boneIdToName)):
+        eb = editBones.new(boneIdToName[i])
+        eb.head = Vector((0.0,0.0,0.0))
+        eb.tail = Vector((0.0,0.1,0.0))
 
-for i in range(len(boneIdToName)):
-    if boneIdToName[i] != "Main":
+    for i in range(len(boneIdToName)):
         parentSceneTreeNodeIndex = find_scene_tree_node(tup, boneIdToName[i])["ParentNodeReferences"][0]
         parentSceneTreeNode = tup["SceneTreeNodePool"]["Node#" + str(parentSceneTreeNodeIndex)]
-        parentName = parentSceneTreeNode["NodeName"]
-        editBones[boneIdToName[i]].parent = editBones[parentName]
+        # Same structural check as compute_world(): only bone-parent in Blender
+        # when the scene-tree parent is actually another Bone node. Root bones
+        # (parent is a Geometry/Transform node, as on non-character props) are
+        # left unparented instead of assuming a node literally named "Main".
+        if parentSceneTreeNode.get("Type") == "Bone":
+            parentName = parentSceneTreeNode["NodeName"]
+            editBones[boneIdToName[i]].parent = editBones[parentName]
 
-for i in range(len(boneIdToName)):
-    name = boneIdToName[i]
-    eb = editBones[name]
-    world = worldMats[i]
-    # edit_bone.matrix expects a matrix in armature space (4x4)
-    # Set the matrix directly:
-    eb.matrix = world
+    for i in range(len(boneIdToName)):
+        name = boneIdToName[i]
+        eb = editBones[name]
+        world = worldMats[i]
+        # edit_bone.matrix expects a matrix in armature space (4x4)
+        # Set the matrix directly:
+        eb.matrix = world
 
-    # Set head/tail if PivotPoint/BoneEndPoint provided (preferred for visualization)
-    pivot = Vector(find_scene_tree_node(tup, name)["PivotPoint"])
-    # pivot = Vector((pivot.x, pivot.y, pivot.z, 1.0))
-    eb.head = pivot
+        # Set head/tail if PivotPoint/BoneEndPoint provided (preferred for visualization)
+        pivot = Vector(find_scene_tree_node(tup, name)["PivotPoint"])
+        # pivot = Vector((pivot.x, pivot.y, pivot.z, 1.0))
+        eb.head = pivot
 
-    if "BoneEndPoint" in find_scene_tree_node(tup, name):
-        endp = Vector(find_scene_tree_node(tup, name)["BoneEndPoint"])
-        endp = Vector((endp.x, endp.y, endp.z))
-        # ensure tail != head (Blender fails on zero-length)
-        if (endp - eb.head).length < 1e-6:
-            eb.tail = eb.head + Vector((0.0, 0.05, 0.0))
+        if "BoneEndPoint" in find_scene_tree_node(tup, name):
+            endp = Vector(find_scene_tree_node(tup, name)["BoneEndPoint"])
+            endp = Vector((endp.x, endp.y, endp.z))
+            # ensure tail != head (Blender fails on zero-length)
+            if (endp - eb.head).length < 1e-6:
+                eb.tail = eb.head + Vector((0.0, 0.05, 0.0))
+            else:
+                eb.tail = endp
         else:
-            eb.tail = endp
-    else:
-        # fallback: set a small tail along bone Y (or take head + local y from world matrix)
-        # Extract local Y axis of the bone in world to make a sensible tail
-        localY = world.to_3x3() @ Vector((0.0, 1.0, 0.0))
-        eb.tail = eb.head + localY.normalized() * 0.1
+            # fallback: set a small tail along bone Y (or take head + local y from world matrix)
+            # Extract local Y axis of the bone in world to make a sensible tail
+            localY = world.to_3x3() @ Vector((0.0, 1.0, 0.0))
+            eb.tail = eb.head + localY.normalized() * 0.1
 
-    # If head exactly equals parent's tail, set as connected
-    if eb.parent:
-        if (eb.head - eb.parent.tail).length < 1e-6:
-            eb.use_connect = True
+        # If head exactly equals parent's tail, set as connected
+        if eb.parent:
+            if (eb.head - eb.parent.tail).length < 1e-6:
+                eb.use_connect = True
 
-# Leave Edit mode.
-bpy.ops.object.mode_set(mode='OBJECT')
+    # Leave Edit mode.
+    bpy.ops.object.mode_set(mode='OBJECT')
 
-# Parent the Armature to every mesh.
-allMeshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
-for mesh in allMeshes:
-    mod = mesh.modifiers.new(name="Armature", type='ARMATURE')
-    mod.object = armatureObj
-    mesh.parent = armatureObj
-    mesh.parent_type = 'ARMATURE'
+    # Parent the Armature to every mesh.
+    allMeshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
+    for mesh in allMeshes:
+        mod = mesh.modifiers.new(name="Armature", type='ARMATURE')
+        mod.object = armatureObj
+        mesh.parent = armatureObj
+        mesh.parent_type = 'ARMATURE'
